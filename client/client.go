@@ -23,7 +23,7 @@ type Connection struct {
 
 var config Config
 
-func readConfig(filename string) error {
+func loadConfig(filename string) error {
 	data, err := ioutil.ReadFile(filename)
 	if err != nil {
 		return fmt.Errorf("error reading config file: %v", err)
@@ -37,7 +37,14 @@ func readConfig(filename string) error {
 	return nil
 }
 
-func udpServer(messages chan<- []byte) {
+func dumpConfig() {
+	fmt.Printf("Local IP: %s\n", config.Local.IP)
+	fmt.Printf("Local Port: %d\n", config.Local.Port)
+	fmt.Printf("Remote IP: %s\n", config.Remote.IP)
+	fmt.Printf("Remote Port: %d\n", config.Remote.Port)
+}
+
+func udpServer(upstream chan<- []byte, downstream <-chan []byte) {
 	addr := net.UDPAddr{
 		Port: config.Local.Port,
 		IP:   net.ParseIP(config.Local.IP),
@@ -46,7 +53,17 @@ func udpServer(messages chan<- []byte) {
 	if err != nil {
 		log.Fatalf("error: %v", err)
 	}
+	// send
+	go func() {
+		for message := range downstream {
+			_, err := conn.WriteToUDP(message, &addr)
+			if err != nil {
+				log.Printf("error: %v", err)
+			}
+		}
+	}()
 
+	// recv
 	for {
 		buffer := make([]byte, 2048)
 		n, _, err := conn.ReadFromUDP(buffer)
@@ -54,11 +71,11 @@ func udpServer(messages chan<- []byte) {
 			log.Printf("error: %v", err)
 			continue
 		}
-		messages <- buffer[:n]
+		upstream <- buffer[:n]
 	}
 }
 
-func tcpClient(messages <-chan []byte) {
+func tcpClient(upstream <-chan []byte, downstream chan<- []byte) {
 	for {
 		conn, err := net.Dial("tcp", config.Remote.IP+":"+strconv.Itoa(config.Remote.Port))
 		if err != nil {
@@ -66,7 +83,28 @@ func tcpClient(messages <-chan []byte) {
 			time.Sleep(2 * time.Second)
 		}
 
-		for message := range messages {
+		//send
+		go func() {
+			for {
+				lenBytes := make([]byte, 2)
+				_, err := conn.Read(lenBytes)
+				if err != nil {
+					log.Printf("error reading message length: %v", err)
+					break
+				}
+				length := int(lenBytes[0])<<8 + int(lenBytes[1])
+				log.Printf("message length: %d", length)
+				buffer := make([]byte, length)
+				n, err := conn.Read(buffer)
+				if err != nil {
+					log.Printf("error reading from server: %v", err)
+					break
+				}
+				downstream <- buffer[:n]
+			}
+		}()
+		//recv
+		for message := range upstream {
 			length := len(message)
 			lenBytes := []byte{byte(length >> 8), byte(length & 0xff)}
 			_, err := conn.Write(lenBytes) // send message length
@@ -90,14 +128,17 @@ func tcpClient(messages <-chan []byte) {
 }
 
 func main() {
-	err := readConfig("conf.yaml")
+	err := loadConfig("conf.yaml")
 	if err != nil {
 		log.Fatalf("error: %v", err)
+	} else {
+		dumpConfig()
 	}
 
-	messages := make(chan []byte, 1024)
-	go udpServer(messages)
-	go tcpClient(messages)
+	msgUpstream := make(chan []byte, 1024)
+	msgDownstream := make(chan []byte, 1024)
+	go udpServer(msgUpstream, msgDownstream)
+	go tcpClient(msgUpstream, msgDownstream)
 	for {
 		time.Sleep(1000 * time.Second)
 	}
